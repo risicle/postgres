@@ -17,6 +17,7 @@
  * inspiration.
  * Configurable penalty costs extension is introduced by Volkan
  * YAZICI <volkan.yazici@gmail.com>.
+ * Converted to use thresholded algorithm by Robert Scott <code@humanleg.org.uk>.
  *
  * metaphone()
  * -----------
@@ -58,6 +59,7 @@ PG_MODULE_MAGIC;
 /*
  * External declarations for exported functions
  */
+extern Datum levenshtein_with_costs_and_threshold(PG_FUNCTION_ARGS);
 extern Datum levenshtein_with_costs(PG_FUNCTION_ARGS);
 extern Datum levenshtein(PG_FUNCTION_ARGS);
 extern Datum metaphone(PG_FUNCTION_ARGS);
@@ -91,7 +93,7 @@ soundex_code(char letter)
 #define MAX_LEVENSHTEIN_STRLEN		255
 
 static int levenshtein_internal(const char *s, const char *t,
-					 int ins_c, int del_c, int sub_c);
+					 int ins_c, int del_c, int sub_c, int threshold);
 
 
 /*
@@ -189,10 +191,16 @@ getcode(char c)
  *						  between supplied strings. Generally
  *						  (1, 1, 1) penalty costs suffices common
  *						  cases, but your mileage may vary.
+ *
+ *						  User-exposed functions deal with invalid values, so
+ *						  they can then be used for in-band signalling to
+ *						  levenshtein_internal, which takes a threshold of -1
+ *						  for no threshold and returns -1 if the search goes over
+ *						  the threshold.
  */
 static int
 levenshtein_internal(const char *s, const char *t,
-					 int ins_c, int del_c, int sub_c)
+					 int ins_c, int del_c, int sub_c , int threshold )
 {
 	int			m,
 				n;
@@ -200,6 +208,9 @@ levenshtein_internal(const char *s, const char *t,
 	int		   *curr;
 	int			i,
 				j;
+	int			sw_diags,
+				ne_diags;
+	int			max_distance;
 	const char *x;
 	const char *y;
 
@@ -211,9 +222,9 @@ levenshtein_internal(const char *s, const char *t,
 	 * into an empty s with m deletions.
 	 */
 	if (!m)
-		return n * ins_c;
+		return ( n * ins_c <= threshold ) || ( threshold < 0 ) ? n * ins_c : -1;
 	if (!n)
-		return m * del_c;
+		return ( m * del_c <= threshold ) || ( threshold < 0 ) ? m * del_c : -1;
 
 	/*
 	 * For security concerns, restrict excessive CPU+RAM usage. (This
@@ -225,10 +236,44 @@ levenshtein_internal(const char *s, const char *t,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("argument exceeds the maximum length of %d bytes",
 						MAX_LEVENSHTEIN_STRLEN)));
-
+	
+	/*
+	 * Calculate an overestimate of the maximum possible distance we can expect to
+	 * return (threshold not taken into account). We can use this value to fill out
+	 * uncalculated cells of the arrays.
+	 */
+	max_distance = Max ( ins_c , Max ( del_c , sub_c ) ) * MAX_LEVENSHTEIN_STRLEN;
+	
+	/* Negative threshold is taken to mean no threshold */
+	if ( threshold < 0 )
+		threshold = max_distance;
+	else
+	{
+		/*
+		* Check for min possible change distance > threshold situations.
+		*
+		* If the diference in length between the two strings * the respective cost to
+		* change that length is greater than the threshold, we can't possibly find an
+		* edit that costs less than that. Bail out.
+		*/
+		if ( ( ( m - n ) * del_c > threshold ) || ( ( n - m ) * ins_c > threshold ) )
+			return -1;
+	}
+	
 	/* One more cell for initialization column and row. */
 	++m;
 	++n;
+	
+	/*
+	 * We only want to explore ( threshold / ins_c ) diagonals off center in
+	 * the SW direction, ( threshold / del_c ) diagonals off center in the
+	 * NE direction.
+	 *
+	 * The optimal solution can only go SW a diagonal by being penalized an ins_c cost, and
+	 * likewise for NE and del_c.
+	 */
+	sw_diags = threshold / ins_c;
+	ne_diags = threshold / del_c;
 
 	/*
 	 * Instead of building an (m+1)x(n+1) array, we'll use two different
@@ -247,14 +292,44 @@ levenshtein_internal(const char *s, const char *t,
 	for (y = t, j = 1; j < n; y++, j++)
 	{
 		int		   *temp;
-
+		int	 starting_column,
+			   ending_column;
+		int		 row_min = max_distance;
+		
+		if ( j - sw_diags <= 1 )
+			/* threshold has no effect on this row in the east direction */
+			starting_column = 1;
+		else
+		{
+			starting_column = j - sw_diags;
+			/*
+			* Initialize the current row's leading value to max_distance to
+			* stop uncalculated values creeping in to the solution for this row
+			*/
+			curr[starting_column-1] = max_distance;
+		}
+		
+		if ( j + ne_diags + 1 >= m )
+			/* threshold has no effect on this row in the west direction */
+			ending_column = m;
+		else
+		{
+			ending_column = j + ne_diags + 1;
+			/*
+			* Initialize the current row's trailing value to max_distance to
+			* stop uncalculated values creeping in to the solution for the
+			* next row.
+			*/
+			curr[ending_column] = max_distance;
+		}
+		
 		/*
 		 * First cell must increment sequentially, as we're on the j'th row of
 		 * the (m+1)x(n+1) array.
 		 */
 		curr[0] = j * ins_c;
-
-		for (x = s, i = 1; i < m; x++, i++)
+		
+		for (x = s + (starting_column-1), i = starting_column; i < ending_column; x++, i++)
 		{
 			int			ins;
 			int			del;
@@ -268,7 +343,14 @@ levenshtein_internal(const char *s, const char *t,
 			/* Take the one with minimum cost. */
 			curr[i] = Min(ins, del);
 			curr[i] = Min(curr[i], sub);
+			
+			/* Possibly update the memo of the row minimum */ 
+			row_min = Min(curr[i], row_min);
 		}
+		
+		/* If there is no entry in the last row lower than or equal to the threshold, bail */
+		if ( row_min > threshold )
+			return -1;
 
 		/* Swap current row with previous row. */
 		temp = curr;
@@ -280,7 +362,36 @@ levenshtein_internal(const char *s, const char *t,
 	 * Because the final value was swapped from the previous row to the
 	 * current row, that's where we'll find it.
 	 */
-	return prev[m - 1];
+	if ( prev[m - 1] <= threshold )
+		return prev[m - 1];
+	else
+		return -1;
+}
+
+
+PG_FUNCTION_INFO_V1(levenshtein_with_costs_and_threshold);
+Datum
+levenshtein_with_costs_and_threshold(PG_FUNCTION_ARGS)
+{
+	char	   *src = TextDatumGetCString(PG_GETARG_DATUM(0));
+	char	   *dst = TextDatumGetCString(PG_GETARG_DATUM(1));
+	int			ins_c = PG_GETARG_INT32(2);
+	int			del_c = PG_GETARG_INT32(3);
+	int			sub_c = PG_GETARG_INT32(4);
+	int			threshold = PG_GETARG_INT32(5);
+	int			r;
+	
+	if ( ins_c <= 0 || del_c <= 0 || sub_c <= 0 )
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("all cost values must be positive")));
+	
+	r = levenshtein_internal(src, dst, ins_c, del_c, sub_c, threshold);
+	
+	if ( r < 0 )
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_INT32(r);
 }
 
 
@@ -293,8 +404,19 @@ levenshtein_with_costs(PG_FUNCTION_ARGS)
 	int			ins_c = PG_GETARG_INT32(2);
 	int			del_c = PG_GETARG_INT32(3);
 	int			sub_c = PG_GETARG_INT32(4);
-
-	PG_RETURN_INT32(levenshtein_internal(src, dst, ins_c, del_c, sub_c));
+	int			r;
+	
+	if ( ins_c <= 0 || del_c <= 0 || sub_c <= 0 )
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("all cost values must be positive")));
+	
+	r = levenshtein_internal(src, dst, ins_c, del_c, sub_c, -1);
+	
+	if ( r < 0 )
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_INT32(r);
 }
 
 
@@ -304,8 +426,14 @@ levenshtein(PG_FUNCTION_ARGS)
 {
 	char	   *src = TextDatumGetCString(PG_GETARG_DATUM(0));
 	char	   *dst = TextDatumGetCString(PG_GETARG_DATUM(1));
+	int	      r;
+	
+	r = levenshtein_internal(src, dst, 1, 1, 1, -1);
 
-	PG_RETURN_INT32(levenshtein_internal(src, dst, 1, 1, 1));
+	if ( r < 0 )
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_INT32(r);
 }
 
 

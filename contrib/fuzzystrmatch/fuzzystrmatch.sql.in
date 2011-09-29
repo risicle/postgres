@@ -11,6 +11,10 @@ CREATE OR REPLACE FUNCTION levenshtein (text,text,int,int,int) RETURNS int
 AS 'MODULE_PATHNAME','levenshtein_with_costs'
 LANGUAGE C IMMUTABLE STRICT;
 
+CREATE OR REPLACE FUNCTION levenshtein (text,text,int,int,int,int) RETURNS int
+AS 'MODULE_PATHNAME','levenshtein_with_costs_and_threshold'
+LANGUAGE C IMMUTABLE STRICT;
+
 CREATE OR REPLACE FUNCTION metaphone (text,int) RETURNS text
 AS 'MODULE_PATHNAME','metaphone'
 LANGUAGE C IMMUTABLE STRICT;
